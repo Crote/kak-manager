@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+
+# requires python 3.5 or later
+
+import os
+import os.path
+import sys
+import subprocess
+import base64
+from enum import Enum
+from tempfile import NamedTemporaryFile
+
+# All user interaction output must go to stderr, as stdout will be executed.
+def eprint(*args, **kwargs):
+  print(*args, file=sys.stderr, **kwargs)
+
+class PathCompare(Enum):
+  parent = 1
+  child = 2
+  equal = 3
+  unrelated = 4
+
+# Returns the relation of `right` to `left`.
+def compare_paths(left, right):
+  if left == right:
+    return PathCompare.equal
+  if os.path.commonpath([left, right]) == left:
+    return PathCompare.child
+  if os.path.commonpath([left, right]) == right:
+    return PathCompare.parent
+  return PathCompare.unrelated
+
+def sessname2path(sess):
+  return base64.b16decode(sess.encode()).decode()
+
+def path2sessname(path):
+  return base64.b16encode(path.encode()).decode()
+
+class Fifo():
+  def __init__(self):
+    # This is an easy way to make sure we have an unused name
+    tmpfile = NamedTemporaryFile()
+    self.name = tmpfile.name
+    tmpfile.close()
+    os.mkfifo(self.name)
+
+  def read(self):
+    fd = os.open(self.name, os.O_RDONLY)
+    file = os.fdopen(fd)
+    content = file.read()
+    file.close()
+    return content
+
+  def close(self):
+    os.unlink(self.name)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    self.close()
+
+def kak_project_paths():
+  raw_session_list = subprocess.run(['kak', '-l'], stdout=subprocess.PIPE).stdout
+  session_lines = raw_session_list.decode().strip().split('\n')
+  session_lines = list(filter(lambda s: s != '', session_lines))
+  sessions = []
+  with Fifo() as f:
+    for name in session_lines:
+      cmd = 'nop %sh{echo "kakpm=$kak_opt_kakpm" > ' + f.name + '}'
+      subprocess.run(['kak', '-p', name], input=cmd, encoding=sys.getdefaultencoding())
+      result = f.read().strip()
+      parts = result.split('=', 1)
+      path = None
+      if len(parts) != 2 or parts[0] != 'kakpm':
+        # something has gone wrong, let's ignore it
+        continue
+      elif len(parts[1]) > 0:
+        path = sessname2path(parts[1])
+      sessions.append((name, path))
+  return sessions
+
+def kak_rename_session(name, newpath):
+  new_sessname = path2sessname(newpath)
+  eprint("Renaming session %s to %s" % (name, newpath))
+  cmd = 'set-option global kakpm ' + new_sessname
+  subprocess.run(['kak', '-p', name], input=cmd, encoding=sys.getdefaultencoding())
+
+def kak_create_session(path):
+  eprint("Starting new session for %s" % path)
+  value = path2sessname(path)
+  return "kak -e 'declare-option str kakpm %s'" % value
+
+def kak_join_session(session):
+  eprint("Joining existing session %s" % session)
+  return "kak -c %s" % session
+
+def identify_sessions(cwd, sessions):
+  exact = []
+  parent = []
+  child = []
+  other = []
+  untracked = []
+  for name, path in sessions:
+    compare = compare_paths(cwd, path)
+    if compare == PathCompare.equal:
+      lst = exact
+    elif compare == PathCompare.parent:
+      lst = parent
+    elif compare == PathCompare.child:
+      lst = child
+    else:
+      lst = other
+    lst.append((name, path))
+  return (exact, parent, child, other, untracked)
+
+def prompt(options, default_option=None):
+  choices = dict()
+  for (key, label, value) in options:
+    if key in choices:
+      raise ValueError('Duplicate prompt key')
+    choices[str(key)] = value
+    eprint("%s) %s" % (key, label))
+  if default_option is not None:
+    eprint("Default: %s" % default_option)
+  result = None
+  while result is None:
+    eprint("Choose an option:")
+    val = sys.stdin.readline().strip()
+    if val == "":
+      val = str(default_option)
+    result = choices.get(val)
+  return result
+
+def prompt_session_expand(name, path, cwd):
+  newpath = os.path.commonpath([path, cwd])
+  eprint("%s can be expanded to include %s by renaming to %s, do you want to do this?" % (path, cwd, newpath))
+  rename = prompt([
+    ("y", "Yes, rename to %s" % newpath, True),
+    ("n", "No, keep as %s" % path, False)
+  ])
+  if rename:
+    return newpath
+  else:
+    return None
+
+def prompt_session_select(exact_match, parents, children, other, untracked):
+  # order:
+  # 1) exact match
+  # 2) parent session, longest path first
+  # 3) child session, shortest path first
+  # 4) other sessions, longest common anchestor first
+  # 5) untracked sessions, random order
+  # default to first item shown. 1, 2 & 3 are empty, default to new session.
+  # TODO: proper ordering in group
+  default = None
+  opts = []
+  eprint("Existing sessions found. Join?")
+  key = 0
+  opts.append((key, "New session", (None, None, False)))
+  key += 1
+  for (name, path) in exact_match:
+    opts.append((key, "Exact: %s @ %s" % (name, path), (name, path, False)))
+    default = default or key
+    key += 1
+  for (name, path) in parents:
+    opts.append((key, "Parent: %s @ %s" % (name, path), (name, path, False)))
+    default = default or key
+    key += 1
+  for (name, path) in children:
+    opts.append((key, "Child: %s @ %s" % (name, path), (name, path, True)))
+    default = default or key
+    key += 1
+  for (name, path) in other:
+    opts.append((key, "Other: %s @ %s" % (name, path), (name, path, True)))
+    key += 1
+  for (name, path) in untracked:
+    opts.append((key, "Untracked: %s @ %s" % (name, path), (name, path, False)))
+    key += 1
+  default = default or 0
+  return prompt(opts, default)
+
+def main(cwd):
+  existing_sessions = kak_project_paths()
+  cmd = None
+  if len(existing_sessions) == 0:
+    # No session exists, so we must create a new one
+    cmd = kak_create_session(cwd)
+  else:
+    # Sessions exist, so we may want to join one
+    identified_sessions = identify_sessions(cwd, existing_sessions)
+    (name, path, expandable) = prompt_session_select(*identified_sessions)
+    if name and expandable:
+      # A session has been picked, but it would not contain the current directory
+      expand = prompt_session_expand(name, path, cwd)
+      if expand:
+        # The user wants to expand the session to contain cwd
+        kak_rename_session(name, expand)
+        cmd = kak_join_session(name)
+      else:
+        # The user does not want to expand
+        cmd = kak_join_session(name)
+    elif name:
+      # A session has been picked, it already contains cwd
+      cmd = kak_join_session(name)
+    else:
+      # No session picked, so we need to create a new one
+      cmd = kak_create_session(cwd)
+  # The last command should be the one actually starting the editor, so we can pass our argument to that
+  print(cmd)
+
+if __name__ == '__main__':
+  main(os.getcwd())
+
